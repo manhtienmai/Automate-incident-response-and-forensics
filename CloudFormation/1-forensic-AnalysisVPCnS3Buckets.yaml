@@ -1,0 +1,496 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: create a VPC with S3 buckets for forensic analysis
+
+Parameters:
+  pObjectLockRetentionPeriod:
+    Type: String
+    Description: object lock retention period for IR artefacts
+    AllowedPattern: "[0-9]*"
+    ConstraintDescription: must be a number
+    Default: 90
+  pSecurityAccount:
+    Type: String
+    Description: security account ID where snapshot processing occurs
+    AllowedPattern: "[0-9]*"
+    MaxLength: 12
+    MinLength: 12
+    ConstraintDescription: must be a 12-digit number
+
+Metadata: {}
+Conditions: {}
+
+Resources:
+########################################
+# S3 buckets creation
+  S3AccessLogs:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-access-logs'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  
+  S3ForensicScripts:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-forensic-scripts'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogs
+        LogFilePrefix: s3-forensic-scripts-logs
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+  
+  S3CloudFormationTemplates:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-cloudformation-templates'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogs
+        LogFilePrefix: s3-cloudformation-templates-logs
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+  
+  S3CloudTrailLogs:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-cloudtrail-logs'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogs
+        LogFilePrefix: s3-cloudtrail-logs
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  
+  S3AWSConfigLogs:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-aws-config-logs'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogs
+        LogFilePrefix: s3-awsconfig-logs-logs
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  
+  S3CloudTrailLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3CloudTrailLogs
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AWSCloudTrailAclCheck
+          Effect: Allow
+          Principal:
+            Service: cloudtrail.amazonaws.com
+          Action: s3:GetBucketAcl
+          Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3CloudTrailLogs}'
+        - Sid: AWSConfigBucketDelivery
+          Effect: Allow
+          Principal:
+            Service: cloudtrail.amazonaws.com
+          Action: "s3:PutObject"
+          Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3CloudTrailLogs}/*'
+          Condition:
+            StringEquals:
+              "s3:x-amz-acl": bucket-owner-full-control
+  S3AWSConfigLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3AWSConfigLogs
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AWSConfigBucketPermissionsCheck
+          Effect: Allow
+          Principal:
+            Service: config.amazonaws.com
+          Action: s3:GetBucketAcl
+          Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3AWSConfigLogs}'
+        - Sid: AWSConfigBucketExistenceCheck
+          Effect: Allow
+          Principal:
+            Service: config.amazonaws.com
+          Action: s3:ListBucket
+          Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3AWSConfigLogs}'
+        - Sid: AWSConfigBucketDelivery
+          Effect: Allow
+          Principal:
+            Service: config.amazonaws.com
+          Action: "s3:PutObject"
+          Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3AWSConfigLogs}/*'
+          Condition:
+            StringEquals:
+              "s3:x-amz-acl": bucket-owner-full-control
+
+  S3VPCFlowLogs:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-vpc-flowlogs'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogs
+        LogFilePrefix: s3-vpc-flowlogs-logs
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  
+  S3SessionManagerLogs:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-session-manager-logs'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogs
+        LogFilePrefix: s3-session-manager-logs-logs
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  
+  S3IRArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-ir-artifacts'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogs
+        LogFilePrefix: s3-ir-artifacts-logs
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveAfter395Days
+            Status: Enabled
+            ExpirationInDays: 1000
+            Transitions:
+              - TransitionInDays: 395
+                StorageClass: GLACIER
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: GOVERNANCE
+            Days: !Ref pObjectLockRetentionPeriod
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+
+# END: S3 Buckets 
+########################################
+
+########################################
+# CloudTrail to S3 bucket
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: "ForensicAccount-ManagementEventsTrail"
+      IsLogging: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - IncludeManagementEvents: true
+          ReadWriteType: All
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      S3BucketName: !Ref S3CloudTrailLogs
+# END: CloudTrail to S3 bucket
+########################################
+#AWS Config enabled and logs to S3 bucket
+  IamRoleForAWSConfig:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ""
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "allow-access-to-config-s3-bucket"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3AWSConfigLogs}/*'
+                Condition:
+                  StringEquals:
+                    "s3:x-amz-acl": bucket-owner-full-control
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetBucketAcl"
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3AWSConfigLogs}'
+      RoleName: "ForensicAccount-AWSConfigRole"
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      RoleARN:
+        Fn::GetAtt:
+          - "IamRoleForAWSConfig"
+          - "Arn"
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+  DeliveryChannel:
+    Type: "AWS::Config::DeliveryChannel"
+    Properties:
+      S3BucketName: !Ref S3AWSConfigLogs
+
+# VPC: 3 subnets
+  # Analysis VPC
+  AnalysisVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.66.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: AnalysisVPC
+  AnalysisFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: "VPC"
+      ResourceId: !Ref AnalysisVPC
+      TrafficType: "ALL"
+      LogDestinationType: "s3"
+      LogFormat: '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}'
+      LogDestination:
+        Fn::GetAtt:
+          - "S3VPCFlowLogs"
+          - "Arn"
+      Tags:
+        - Key: Name
+          Value: VpcFlowLogs-AnalysisVPC
+  
+  # Analysis VPC 3x subnet
+  AnalysisSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.66.1.0/24
+      VpcId: !Ref AnalysisVPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: AnalysisSubnet1
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+
+  AnalysisSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.66.2.0/24
+      VpcId: !Ref AnalysisVPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: AnalysisSubnet2
+      AvailabilityZone: !Select [ 1, !GetAZs ]
+
+  AnalysisSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.66.3.0/24
+      VpcId: !Ref AnalysisVPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: AnalysisSubnet3
+      AvailabilityZone: !Select [ 2, !GetAZs ]
+  
+  # Analysis VPC route table
+  AnalysisRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AnalysisVPC
+      Tags:
+        - Key: Name
+          Value: AnalysisRouteTable
+  
+  AnalysisRouteTableSubnetAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AnalysisSubnet1
+      RouteTableId: !Ref AnalysisRouteTable
+  
+  AnalysisRouteTableSubnetAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AnalysisSubnet2
+      RouteTableId: !Ref AnalysisRouteTable
+  
+  AnalysisRouteTableSubnetAssociation3:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AnalysisSubnet3
+      RouteTableId: !Ref AnalysisRouteTable
+  
+  # Security for Ec2 instances in Analysis VPC
+  AnalysisInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 instances(IR Instance) in Analysis VPC
+      GroupName: ir-instance-sg
+      VpcId: !Ref AnalysisVPC
+      SecurityGroupIngress:
+        - Description: Allow all outbound traffic
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+  
+  # Endpoint
+  AnalysisEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for IR VPC Endpoints
+      GroupName: ir-vpce-sg
+      SecurityGroupIngress:
+      - IpProtocol: 'tcp'
+        FromPort: 443
+        ToPort: 443
+        SourceSecurityGroupId: !Ref AnalysisInstanceSecurityGroup # only ec2 in sg can access the endpoint
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref AnalysisVPC
+  
+  # create VPC endpoints to help ec2 instances in VPC access AWS services internally without going through the internet
+  AnalysisS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+              - 's3:CreateMultipartUpload'
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3IRArtifactBucket}/*'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref AnalysisRouteTable
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref AnalysisVPC
+  
+  AnalysisSSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      SubnetIds:
+        - !Ref AnalysisSubnet1
+        - !Ref AnalysisSubnet2
+        - !Ref AnalysisSubnet3
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref AnalysisEndpointSecurityGroup
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref AnalysisVPC
+  
+  AnalysisSSMMessageEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      SubnetIds:
+        - !Ref AnalysisSubnet1
+        - !Ref AnalysisSubnet2
+        - !Ref AnalysisSubnet3
+      PrivateDnsEnabled: true
+      VpcEndpointType: Interface
+      SecurityGroupIds:
+        - !Ref AnalysisEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref AnalysisVPC
+  
+  AnalysisEC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      SubnetIds:
+        - !Ref AnalysisSubnet1
+        - !Ref AnalysisSubnet2
+        - !Ref AnalysisSubnet3
+      PrivateDnsEnabled: true
+      VpcEndpointType: Interface
+      SecurityGroupIds:
+        - !Ref AnalysisEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref AnalysisVPC
+  
+  AnalysisEC2InstanceRoleS3ReadOnly:
+    Type: AWS::IAM::Role
+    Metadata:
+      Comment: Role used by SOC for accessing the instances through SSM and S3 read-only access
+    Properties:
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonS3ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+        Version: '2012-10-17'
+  
+  AnalysisEC2InstanceRoleS3ReadWrite:
+    Type: AWS::IAM::Role
+    Metadata:
+      Comment: Role used by SOC for accessing the instances through SSM and S3 read-write access
+      Properties:
+        ManagedPolicyArns:
+          - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        Policies:
+          - PolicyName: S3ReadWrite
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - "s3:ListBucket"
+                    - "s3:*Object*"
+                    - "s3:GetBucketLocation"
+                  Resource: !GetAtt S3IRArtifactBucket.Arn
+        AssumeRolePolicyDocument:
+          Statement:
+            - Action:
+              - sts:AssumeRole
+              Effect: Allow
+              Principal:
+                Service: ec2.amazonaws.com
+          Version: '2012-10-17'
+
+##############################
