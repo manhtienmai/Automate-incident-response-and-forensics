@@ -26,7 +26,7 @@ Resources:
     Type: AWS::S3::Bucket
     DeletionPolicy: Delete
     Properties:
-      BucketName: !Sub '${AWS::AccountId}-access-logs'
+      BucketName: !Sub '${AWS::AccountId}-access-logs-${AWS::StackName}'
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -64,7 +64,7 @@ Resources:
   
   S3CloudTrailLogs:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Delete
+    DeletionPolicy: Retain
     Properties:
       BucketName: !Sub '${AWS::AccountId}-cloudtrail-logs'
       LoggingConfiguration:
@@ -101,15 +101,16 @@ Resources:
             Service: cloudtrail.amazonaws.com
           Action: s3:GetBucketAcl
           Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3CloudTrailLogs}'
-        - Sid: AWSConfigBucketDelivery
+        - Sid: AWSCloudTrailWrite
           Effect: Allow
           Principal:
             Service: cloudtrail.amazonaws.com
-          Action: "s3:PutObject"
-          Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3CloudTrailLogs}/*'
+          Action: s3:PutObject
+          Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3CloudTrailLogs}/AWSLogs/*'
           Condition:
             StringEquals:
-              "s3:x-amz-acl": bucket-owner-full-control
+              "s3:x-amz-acl": "bucket-owner-full-control"
+              "aws:SourceAccount": !Ref AWS::AccountId
   S3AWSConfigLogsBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -167,7 +168,7 @@ Resources:
   
   S3IRArtifactBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
+    DeletionPolicy: Delete # Retain if you want to keep the artifacts after stack deletion
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub '${AWS::AccountId}-ir-artifacts'
@@ -207,6 +208,9 @@ Resources:
 # CloudTrail to S3 bucket
   CloudTrail:
     Type: AWS::CloudTrail::Trail
+    DependsOn: 
+      - S3CloudTrailLogs
+      - S3CloudTrailLogsBucketPolicy
     Properties:
       TrailName: "ForensicAccount-ManagementEventsTrail"
       IsLogging: true
@@ -214,8 +218,8 @@ Resources:
       EventSelectors:
         - IncludeManagementEvents: true
           ReadWriteType: All
-      IsMultiRegionTrail: true
       IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: false  
       S3BucketName: !Ref S3CloudTrailLogs
 # END: CloudTrail to S3 bucket
 ########################################
@@ -224,7 +228,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSConfigRole
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -283,7 +287,7 @@ Resources:
       ResourceId: !Ref AnalysisVPC
       TrafficType: "ALL"
       LogDestinationType: "s3"
-      LogFormat: '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}'
+      LogFormat: '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${vpc-id} ${subnet-id} ${instance-id}'
       LogDestination:
         Fn::GetAtt:
           - "S3VPCFlowLogs"
@@ -470,27 +474,27 @@ Resources:
     Type: AWS::IAM::Role
     Metadata:
       Comment: Role used by SOC for accessing the instances through SSM and S3 read-write access
-      Properties:
-        ManagedPolicyArns:
-          - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
-        Policies:
-          - PolicyName: S3ReadWrite
-            PolicyDocument:
-              Version: '2012-10-17'
-              Statement:
-                - Effect: Allow
-                  Action:
-                    - "s3:ListBucket"
-                    - "s3:*Object*"
-                    - "s3:GetBucketLocation"
-                  Resource: !GetAtt S3IRArtifactBucket.Arn
-        AssumeRolePolicyDocument:
-          Statement:
-            - Action:
-              - sts:AssumeRole
-              Effect: Allow
-              Principal:
-                Service: ec2.amazonaws.com
-          Version: '2012-10-17'
+    Properties:
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3ReadWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:*Object*"
+                  - "s3:GetBucketLocation"
+                Resource: !GetAtt S3IRArtifactBucket.Arn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
 
 ##############################

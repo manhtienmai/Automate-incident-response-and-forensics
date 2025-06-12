@@ -1,0 +1,328 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates parts of Forensics Env
+
+Parameters:
+  S3VPCFlowLogs:
+    Type: String
+    Description: name s3 bucket for VPC Flow Logs
+    Default: 'vpc-flow-logs'
+    AllowedPattern: "[a-zA-Z0-9-.]*"
+    ConstraintDescription: bucket name must contain only lowercase letters, numbers, periods, and dashes.
+
+Resources:
+###################
+  # Maintenance VPC:
+  MaintenanceVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MaintenanceVPC
+  
+  # Enable flow logs on Maintenance VPC:
+  MaintenanceFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: "VPC"
+      ResourceId: !Ref MaintenanceVPC
+      TrafficType: ALL
+      LogDestinationType: "s3"
+      LogFormat: '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}'
+      LogDestination: !Sub "arn:${AWS::Partition}:s3:::${S3VPCFlowLogs}"
+      Tags:
+        - Key: Name
+          Value: MaintenanceVPCFlowLogs
+  
+  # Maintenance VPC - internet access:
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: MaintenanceVPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MaintenanceVPC
+      InternetGatewayId: !Ref InternetGateway
+  
+  # Maintenance Subnet - public and private:
+  MaintenancePublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MaintenanceVPC
+      CidrBlock: 10.0.0.0/17
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Maintenance-Public
+  
+  MaintenancePrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MaintenanceVPC
+      CidrBlock: 10.0.128.0/17
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Maintenance-Private
+  
+  # Security groups for Maintenance VPC:
+  SecurityGroupPublic:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Public Security Group with just egress Rule"
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+      VpcId:
+        Ref: MaintenanceVPC
+
+  SecurityGroupPrivate:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: MaintenanceVPC
+    Properties:
+      GroupDescription: Private security group
+      VpcId: 
+        Ref: MaintenanceVPC
+  SecurityGroupPrivateIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: SecurityGroupPrivate
+    Properties:
+      GroupId: 
+        Ref: SecurityGroupPrivate
+      IpProtocol: "-1"
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: 
+        Ref: SecurityGroupPrivate
+  SecurityGroupPrivateEgressRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: SecurityGroupPrivate
+    Properties:
+      IpProtocol: "-1"
+      FromPort: 0
+      ToPort: 65535
+      CidrIp: 0.0.0.0/0
+      GroupId:
+        Ref: SecurityGroupPrivate
+  
+  # A NAT Gateway
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIPAddress.AllocationId
+      SubnetId: !Ref MaintenancePublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub NAT-${AWS::StackName}
+  ElasticIPAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: "vpc"
+  
+  # Route Table for Public Subnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MaintenanceVPC
+      Tags:
+        - Key: Name
+          Value: Public Route
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  
+  # Private Route Table
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MaintenanceVPC
+      Tags:
+        - Key: Name
+          Value: Private Route
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+  
+  # attach subnets to route tables
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MaintenancePublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MaintenancePrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+######################
+# EC2 Image Builder - build Forensic AMI based on Ubuntu 22 and SIFT
+  ImageBuilderLogBucket:
+    Type: AWS::S3::Bucket
+    # DeletionPolicy: Retain
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Comment: "Role for EC2 Image Builder to build Forensic AMI"
+    Properties:
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: '2012-10-17'
+      Path: /executionServiceEC2Role/
+  
+  InstanceRoleLoggingPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      Comment: "Policy for EC2 Image Builder to write logs to S3"
+    Properties:
+      PolicyName: ImageBuilderLogBucketPolicy
+      Roles:
+        - Ref: InstanceRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource:
+              - Fn::Sub: 
+                  - arn:${AWS::Partition}:s3:::${BUCKET}/*
+                  - BUCKET: !Ref ImageBuilderLogBucket
+  
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /executionServiceEC2Role/
+      Roles:
+        - Ref: InstanceRole
+  
+  SIFTImageInfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: Ubuntu22SIFTImageInfrastructureConfiguration
+      InstanceProfileName:
+        Ref: InstanceProfile
+      InstanceTypes:
+        - t2.micro
+      Logging:
+        S3Logs:
+          S3BucketName:
+            Ref: ImageBuilderLogBucket
+          S3KeyPrefix: !Join [ "-", [ 'imagebuilder', !Ref AWS::StackName] ]
+      TerminateInstanceOnFailure: true
+      SubnetId: !Ref MaintenancePrivateSubnet
+      SecurityGroupIds:
+        - Ref: SecurityGroupPrivate
+  
+  InstallSIFTComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: install-basic-forensic-tools
+      Version: 1.0.0
+      Description: "Install SIFT on Ubuntu 22"
+      ChangeDescription: "Basic forensic toolkit"
+      Platform: Linux
+      Data: |
+        name: install-basic-forensic-tools
+        description: Install basic forensic tools on Ubuntu 22
+        schemaVersion: 1.0
+
+        phases:
+          - name: build
+            steps:
+              - name: install-forensic-tools
+                action: ExecuteBash
+                timeoutSeconds: 1800
+                inputs:
+                  commands:
+                    - |
+                      #!/bin/bash
+                      set -e
+
+                      # Enable universe repo for more packages
+                      add-apt-repository universe -y
+
+                      apt-get update -y
+                      apt-get upgrade -y
+
+                      # Install basic forensic tools 
+                      apt-get install -y sleuthkit autopsy hexedit binwalk foremost testdisk dc3dd gddrescue ewf-tools python3 python3-pip git vim tree file binutils xxd
+
+                      echo "Basic forensic tools installed on Ubuntu Linux successfully"
+        
+  SIFTImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: Ubuntu22SIFTImageRecipe
+      Version: 1.0.0
+      ParentImage:
+        Fn::Sub: arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:image/ubuntu-server-22-lts-x86/x.x.x
+      BlockDeviceMappings:
+        - DeviceName: '/dev/sda1'
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp2
+      Components:
+        - ComponentArn: !Join [ '',['arn:aws:imagebuilder:', !Ref 'AWS::Region',':aws:component/update-linux/x.x.x']]
+        - ComponentArn: 
+            Ref: InstallSIFTComponent
+        - ComponentArn: !Join [ '',['arn:aws:imagebuilder:', !Ref 'AWS::Region',':aws:component/reboot-linux/x.x.x']]
+  SIFTImage:
+    Type: AWS::ImageBuilder::Image
+    Properties:
+      ImageRecipeArn: 
+        Ref: SIFTImageRecipe
+      InfrastructureConfigurationArn:
+        Ref: SIFTImageInfrastructureConfiguration
+
+  SIFTImageParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: "SIFT Image ID"
+      Name: /Test/Images/SIFTImage
+      Type: String
+      Value:
+        Fn::GetAtt: [ SIFTImage, ImageId]
+    DependsOn: SIFTImage
+  
+  SIFTDistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: SIFTDistributionConfiguration
+      Description: "SIFT Distribution Configuration"
+      Distributions:
+        - Region: !Ref AWS::Region
+          AmiDistributionConfiguration:
+            Name: 'ami-forensic-image {{ imagebuilder:buildDate }}'
+            Description: 'Forensic AMI with SIFT installed'
+  
+  ForensicImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: 'Forensic-Image-Pipeline'
+      Description: 'Pipeline to build Forensic AMI with SIFT'
+      Status: ENABLED
+      ImageRecipeArn: !Ref SIFTImageRecipe
+      InfrastructureConfigurationArn: !Ref SIFTImageInfrastructureConfiguration
+      DistributionConfigurationArn: !Ref SIFTDistributionConfiguration
+      Schedule:
+        ScheduleExpression: 'cron(0 9 ? * sun)'
+        PipelineExecutionStartCondition: 'EXPRESSION_MATCH_ONLY'
