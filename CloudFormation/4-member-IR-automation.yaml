@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Member IR Automation - EC2 Isolation & Slack Notifications"
+
+Parameters:
+  pSecurityAccount:
+    Type: String
+    Description: Security Account ID
+    AllowedPattern: "[0-9]{12}"
+
+  pSlackWebhookURL:
+    Type: String
+    Description: Slack Webhook URL
+    NoEcho: true
+
+  pSlackChannel:
+    Type: String 
+    Default: "#security-alerts"
+
+  pSecurityAccountSNSTopic:
+    Type: String
+    Description: SNS Topic ARN in Security Account
+
+Resources:
+  # 1️⃣ IAM ROLES 
+  rIsolationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EC2-Isolation-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSDenyAll
+
+  rAnalysisRole:
+    Type: AWS::IAM::Role  
+    Properties:
+      RoleName: EC2-Analysis-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: StopInstance
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:StopInstances
+                Resource: "*"
+
+  # Instance Profiles
+  rIsolationInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref rIsolationRole]
+
+  rAnalysisInstanceProfile:
+    Type: AWS::IAM::InstanceProfile  
+    Properties:
+      Roles: [!Ref rAnalysisRole]
+
+  # 2️⃣ LAMBDA EXECUTION ROLE
+  rLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IRAutomation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                  - iam:PassRole
+                  - sns:Publish
+                Resource: "*"
+
+  # 3️⃣ SNS TOPIC - Local notifications
+  rLocalSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ir-local-notifications
+      Subscription:
+        - Protocol: lambda
+          Endpoint: !GetAtt rSlackFunction.Arn
+
+  # 4️⃣ SLACK NOTIFICATION FUNCTION
+  rSlackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IR-SlackNotification
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt rLambdaRole.Arn
+      Environment:
+        Variables:
+          SLACK_URL: !Ref pSlackWebhookURL
+          SLACK_CHANNEL: !Ref pSlackChannel
+      Code:
+        ZipFile: |
+          import json
+          import urllib3
+          import os
+          
+          http = urllib3.PoolManager()
+          
+          def handler(event, context):
+              try:
+                  message = event['Records'][0]['Sns']['Message']
+                  
+                  payload = {
+                      "channel": os.environ['SLACK_CHANNEL'],
+                      "text": f"🚨 IR Alert: {message}",
+                      "username": "AWS Security Bot"
+                  }
+                  
+                  response = http.request(
+                      'POST',
+                      os.environ['SLACK_URL'],
+                      body=json.dumps(payload),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  
+                  return {'statusCode': 200}
+              except Exception as e:
+                  print(f"Error: {e}")
+                  return {'statusCode': 500}
+
+  # 5️⃣ MAIN IR FUNCTION - Drastically Simplified  
+  rIRFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IR-InstanceHandler
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt rLambdaRole.Arn
+      Timeout: 180
+      Environment:
+        Variables:
+          ISOLATION_PROFILE: !Ref rIsolationInstanceProfile
+          ANALYSIS_PROFILE: !Ref rAnalysisInstanceProfile
+          LOCAL_SNS: !Ref rLocalSNSTopic
+          SECURITY_SNS: !Ref pSecurityAccountSNSTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          
+          ec2 = boto3.client('ec2')
+          sns = boto3.client('sns')
+          
+          def handler(event, context):
+              try:
+                  # Extract instance ID from event
+                  instance_id = event['resources'][0].split('/')[-1]
+                  tags = event['detail']['tags']
+                  
+                  if 'SecurityIncidentStatus' not in event['detail']['changed-tag-keys']:
+                      return
+                  
+                  status = tags.get('SecurityIncidentStatus')
+                  
+                  if status == 'Analyze':
+                      handle_analyze(instance_id)
+                  elif status == 'Contain':
+                      handle_contain(instance_id)
+                  
+              except Exception as e:
+                  notify_error(f"IR Handler failed: {str(e)}")
+          
+          def handle_analyze(instance_id):
+              # 1. Enable termination protection
+              ec2.modify_instance_attribute(
+                  InstanceId=instance_id,
+                  DisableApiTermination={'Value': True}
+              )
+              
+              # 2. Change to analysis role
+              change_instance_role(instance_id, os.environ['ANALYSIS_PROFILE'])
+              
+              # 3. Notify security account
+              notify_security_account(instance_id)
+              
+              notify_local(f"Instance {instance_id} prepared for analysis")
+          
+          def handle_contain(instance_id):
+              # 1. Change to isolation role (deny all)
+              change_instance_role(instance_id, os.environ['ISOLATION_PROFILE'])
+              
+              # 2. Create isolation security group
+              vpc_id = get_instance_vpc(instance_id)
+              sg_id = create_isolation_sg(vpc_id)
+              
+              # 3. Apply isolation security group
+              ec2.modify_instance_attribute(
+                  InstanceId=instance_id,
+                  Groups=[sg_id]
+              )
+              
+              notify_local(f"Instance {instance_id} isolated successfully")
+          
+          def change_instance_role(instance_id, new_profile_arn):
+              # Remove current profile
+              try:
+                  associations = ec2.describe_iam_instance_profile_associations(
+                      Filters=[{'Name': 'instance-id', 'Values': [instance_id]}]
+                  )['IamInstanceProfileAssociations']
+                  
+                  for assoc in associations:
+                      ec2.disassociate_iam_instance_profile(
+                          AssociationId=assoc['AssociationId']
+                      )
+              except:
+                  pass
+              
+              # Add new profile
+              ec2.associate_iam_instance_profile(
+                  IamInstanceProfile={'Arn': new_profile_arn},
+                  InstanceId=instance_id
+              )
+          
+          def get_instance_vpc(instance_id):
+              response = ec2.describe_instances(InstanceIds=[instance_id])
+              return response['Reservations'][0]['Instances'][0]['VpcId']
+          
+          def create_isolation_sg(vpc_id):
+              try:
+                  # Try to find existing isolation SG
+                  sgs = ec2.describe_security_groups(
+                      Filters=[
+                          {'Name': 'vpc-id', 'Values': [vpc_id]},
+                          {'Name': 'group-name', 'Values': ['ir-isolation']}
+                      ]
+                  )['SecurityGroups']
+                  
+                  if sgs:
+                      return sgs[0]['GroupId']
+                  
+                  # Create new isolation SG (no rules = deny all)
+                  response = ec2.create_security_group(
+                      GroupName='ir-isolation',
+                      Description='IR Isolation - Deny All Traffic',
+                      VpcId=vpc_id
+                  )
+                  
+                  sg_id = response['GroupId']
+                  
+                  # Remove default egress rule
+                  ec2.revoke_security_group_egress(
+                      GroupId=sg_id,
+                      IpPermissions=[{
+                          'IpProtocol': '-1',
+                          'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                      }]
+                  )
+                  
+                  return sg_id
+                  
+              except Exception as e:
+                  notify_error(f"Failed to create isolation SG: {str(e)}")
+                  raise
+          
+          def notify_security_account(instance_id):
+              message = {
+                  "account": boto3.client('sts').get_caller_identity()['Account'],
+                  "instance_id": instance_id,
+                  "region": os.environ['AWS_REGION']
+              }
+              
+              sns.publish(
+                  TopicArn=os.environ['SECURITY_SNS'],
+                  Message=json.dumps(message)
+              )
+          
+          def notify_local(message):
+              sns.publish(
+                  TopicArn=os.environ['LOCAL_SNS'],
+                  Message=message
+              )
+          
+          def notify_error(error_msg):
+              sns.publish(
+                  TopicArn=os.environ['LOCAL_SNS'],
+                  Message=f"❌ ERROR: {error_msg}"
+              )
+
+  # 6️⃣ CLOUDWATCH EVENT RULE
+  rTagChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: IR-EC2TagChange
+      EventPattern:
+        source: ["aws.tag"]
+        detail:
+          service: ["ec2"]
+          resource-type: ["instance"]
+          changed-tag-keys: ["SecurityIncidentStatus"]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt rIRFunction.Arn
+          Id: IRFunctionTarget
+
+  # 7️⃣ PERMISSIONS
+  rSlackPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref rSlackFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref rLocalSNSTopic
+
+  rIRPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref rIRFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt rTagChangeRule.Arn
+
+Outputs:
+  IsolationRole:
+    Value: !GetAtt rIsolationInstanceProfile.Arn
+  AnalysisRole:
+    Value: !GetAtt rAnalysisInstanceProfile.Arn
+  IRFunction:
+    Value: !GetAtt rIRFunction.Arn
