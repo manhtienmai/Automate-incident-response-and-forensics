@@ -1,0 +1,1343 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Simple EC2 snapshot demo with Step FUnctions
+Parameters:
+  pAvailabilityZone:
+    Type: "AWS::EC2::AvailabilityZone::Name"
+    Description: Availability Zone to Launch EC2 instance
+    
+  pAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+    Description: Amazon Linux AMI for DD Copy - Don't change.
+  
+  pIRArtifactBucket:
+    Type: String
+    Description: Name of the Forensic Account S3 IR Artifacts Bucket
+
+  pOrgId:
+    Type: String
+    Description: Organization ID to which the target accounts belong
+    AllowedPattern: "^o-[a-z0-9]{10,32}$"
+    MaxLength: 34
+    MinLength: 12
+    ConstraintDescription: Organization ID string requires "o-" followed by from 10 to 32 lowercase letters or digits.
+
+  pSecurityAccount:
+    Type: String
+    Description: AWS Account Number of the Security Account where snapshot processing occurs
+    AllowedPattern: "[0-9]*"
+    MaxLength: 12
+    MinLength: 12
+    ConstraintDescription: account number must contain only numbers.
+
+Resources:
+  rLambdaTriggerIRStepFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+          StepFunction: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:DiskAcquisitionSimplified"
+      
+      Code:
+        ZipFile: |
+          import json, time
+          import boto3
+          import os
+          client = boto3.client('stepfunctions')
+          stepfunction = os.environ['StepFunction']
+
+          def generate_case_id(account, instance_id, region):
+              epoch_time = str(int(time.time()))
+              case_id = '-'.join([account, instance_id, region, epoch_time])
+              return case_id
+          
+          def trigger_stepfunctions(case_id, account, instance_id, region):
+              step_function_input = {
+                  "CaseId": case_id,
+                  "Account": account,
+                  "InstanceId": instance_id,
+                  "Region": region,
+                  "RetainArtefacts": "true"
+                  }
+              input = json.dumps(step_function_input)
+              response = client.start_execution(
+                  stateMachineArn=stepfunction,
+                  name='sf-forensics-'+case_id,
+                  input=input)
+              print(response)
+          
+          def lambda_handler(event, context):
+              msg = json.loads(event['Records'][0]['Sns']['Message'])
+              account = msg['account']
+              instance_id = msg['instance_id']
+              region = msg['region']
+              case_id = generate_case_id(account, instance_id, region)
+              trigger_stepfunctions(case_id, account, instance_id, region)
+      Role: !GetAtt rSNSLambdaRole.Arn
+      FunctionName: LambdaTriggerIRStepFunction
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 128
+      Description: Lambda function to trigger the IR Step Function for disk snapshot processing
+  
+  rSNSInvokeLambdaPermissions:
+    DependsOn: rLambdaTriggerIRStepFunction
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref "rLambdaTriggerIRStepFunction"
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref rSecurityIncidentEventTopic
+  
+  rSNSLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SNSSecurityEventLambdaRole
+      Path: /
+      Policies:
+        - PolicyName: SNSSecurityEventLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt rForensicsStateMachineDisk.Arn
+              # KMS permissions for SNS
+              - Effect: Allow
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:GenerateDataKey*"
+                Resource: !GetAtt rIRMasterKey.Arn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+  rSecurityIncidentEventTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref rIRMasterKey
+      Subscription:
+        - Endpoint: !GetAtt rLambdaTriggerIRStepFunction.Arn
+          Protocol: lambda
+      TopicName: 'security-incident-event-topic'
+  
+  rSecurityIncidentEventTopicPolicy:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F18
+            reason: "This is still ok considering it's constrained by the condition key on the organization principal."
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Sid: AllowServices
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: 
+              - 'sns:Publish'
+            Resource:
+              - !Ref rSecurityIncidentEventTopic
+          - Sid: AllowAWSPublish
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action: 'sns:Publish'
+            Resource:
+              - !Ref rSecurityIncidentEventTopic
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref pOrgId
+      Topics:
+        - !Ref rSecurityIncidentEventTopic
+
+  # ===== SINGLE KMS KEY FOR ALL IR RESOURCES =====
+  rIRMasterKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for all IR workflow
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # root access
+          - Sid: Enable IAM user permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          
+          # Lambda roles access
+          - Sid: Allow lambda roles to use the key
+            Effect: Allow
+            Principal:
+              AWS: "*"
+                # - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/SnapshotAutomationLambdaRole"
+                # - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/SnapshotAutomationS3Copy"
+                # - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/SNSSecurityEventLambdaRole"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+              - "kms:CreateGrant"
+              - "kms:ListGrants"
+              - "kms:RevokeGrant"
+            Resource: "*"
+
+          # EC2 Service access for snapshots/volumes
+          - Sid: Allow ec2 to use the key
+            Effect: Allow
+            Principal:
+              AWS: "*"
+                # - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/SnapshotAutomationLambdaRole"
+                # - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/SnapshotAutomationS3Copy"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:CreateGrant"
+              - "kms:DescribeKey"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: 
+                  - !Sub ec2.${AWS::Region}.amazonaws.com
+                  - !Sub sns.${AWS::Region}.amazonaws.com
+                kms:CallerAccount: !Ref AWS::AccountId
+              Bool:
+                kms:GrantIsForAWSResource: "true"
+          # Cross-account access for organization members
+          - Sid: "Allow cross-account access for organization"
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+              - kms:CreateGrant
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref pOrgId
+  
+  # Single alias for all IR resources
+  rIRKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/ir/master
+      TargetKeyId: !Ref rIRMasterKey
+  
+  rLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: SnapshotAutomationLambdaRole
+      Path: /
+      Policies:
+        - PolicyName: SnapshotAutomation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              # Cross-account assume role
+              - Effect: Allow
+                Action: 
+                  - "sts:AssumeRole"
+                Resource: 
+                  - !Sub "arn:${AWS::Partition}:iam::*:role/IRAutomation"
+
+              # Logging
+              - Effect: Allow
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:${AWS::Partition}:logs:*:*:*"
+                
+              # EC2 permissions
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateVolume"
+                  - "ec2:CreateSnapshot"
+                  - "ec2:AttachVolume"
+                  - "ec2:DetachVolume"
+                  - "ec2:CreateTags"
+                  - "ec2:DescribeVolumes"
+                  - "ec2:DescribeVolumeStatus"
+                  - "ec2:DescribeVolumeAttribute"
+                  - "ec2:DescribeVolumesModifications"
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeSnapshots"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeVpcs"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeTags"
+                  - "ec2:CopySnapshot"
+                  - "ec2:RunInstances"
+                Resource: "*"
+
+              # Conditional delete for IR resources only
+              - Effect: Allow
+                Action:
+                  - "ec2:TerminateInstances"
+                  - "ec2:DeleteVolume"
+                  - "ec2:DeleteSnapshot"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/ir-acquisition: "True"
+
+              # S3 permissions
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource: !GetAtt rS3CopyRole.Arn
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:PutObjectAcl"
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${pIRArtifactBucket}/*"
+              
+              # SSM permissions
+              - Effect: Allow
+                Action:
+                  - "ssm:GetParameter"
+                  - "ssm:GetParameters"
+                  - "ssm:SendCommand"
+                  - "ssm:GetCommandInvocation"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "sqs:SendMessage"
+                Resource: "*"
+
+               # KMS permissions (unified)
+              - Effect: Allow
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:Encrypt"
+                  - "kms:ReEncrypt*"
+                  - "kms:GenerateDataKey*"
+                  - "kms:DescribeKey"
+                  - "kms:CreateGrant"
+                  - "kms:ListGrants"
+                  - "kms:RevokeGrant"
+                Resource: !GetAtt rIRMasterKey.Arn
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+  
+  rKmsPolicy:
+    Type: "AWS::IAM::Policy"
+    DependsOn: rIRMasterKey
+    Properties:
+      PolicyName: CFNUsers
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "kms:Decrypt"
+              - "kms:Encrypt"
+              - "kms:ReEncrypt*"
+              - "kms:DescribeKey"
+              - "kms:CreateGrant"
+              - "kms:ListGrants"
+              - "kms:RevokeGrant"
+              - "kms:GenerateDataKey*"
+            Resource: !GetAtt rIRMasterKey.Arn
+      Roles:
+        - !Ref rLambdaRole
+
+  rS3CopyInstanceProfile:
+   Type: AWS::IAM::InstanceProfile
+   Properties:
+     InstanceProfileName: S3CopyInstanceProfile
+     Path: /
+     Roles:
+       - !Ref rS3CopyRole
+  
+  rS3CopyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SnapshotAutomationS3Copy
+      MaxSessionDuration: 43200
+      Path: /
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 
+      Policies:
+        - PolicyName: CopySnapshotToS3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:CreateMultipartUpload"
+                  - "s3:AbortMultipartUpload"
+                  - "s3:GetBucketLocation"                  
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:PutObject"
+                  - "s3:PutObjectAcl"
+                  - "s3:HeadObject"
+                Resource: #was: #!Sub "arn:${AWS::Partition}:s3:::${pIRBunkerBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${pIRArtifactBucket}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${pIRArtifactBucket}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+  
+  rCreateSnapshotAndWait:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          Region: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import uuid
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  # Ensure InstanceId is list
+                  instance_ids = event['InstanceId'] if isinstance(event['InstanceId'], list) else [event['InstanceId']]
+                  
+                  # Assume role
+                  sts_client = boto3.client('sts')
+                  assumed_role = sts_client.assume_role(
+                      RoleArn=f'arn:{os.environ.get("Partition", "aws")}:iam::{event["Account"]}:role/IRAutomation',
+                      RoleSessionName=f'{str(uuid.uuid4())[:5]}-snapshot'
+                  )
+                  
+                  ec2 = boto3.Session(
+                      aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
+                      aws_session_token=assumed_role['Credentials']['SessionToken']
+                  ).client('ec2', region_name=event['Region'])
+                  
+                  # Get instances and create snapshots
+                  response = ec2.describe_instances(InstanceIds=instance_ids)
+                  output = []  # ✅ FLAT ARRAY
+                  snapshot_ids = []
+                  
+                  for res in response['Reservations']:
+                      for instance in res['Instances']:
+                          for vol in instance['BlockDeviceMappings']:
+                              if vol['Ebs']['Status'] != 'detached':
+                                  snap = ec2.create_snapshot(
+                                      Description=f"IR Snapshot: {instance['InstanceId']}",
+                                      VolumeId=vol['Ebs']['VolumeId'],
+                                      TagSpecifications=[{
+                                          'ResourceType': 'snapshot',
+                                          'Tags': [
+                                              {'Key': 'ir-acquisition', 'Value': 'True'},
+                                              {'Key': 'case-id', 'Value': event['CaseId']}
+                                          ]
+                                      }]
+                                  )
+                                  
+                                  # ✅ FLAT STRUCTURE
+                                  output.append({
+                                      "instanceId": instance['InstanceId'],
+                                      "volumeId": vol['Ebs']['VolumeId'],
+                                      "snapshotId": snap['SnapshotId'],
+                                      "availabilityZone": instance['Placement']['AvailabilityZone']
+                                  })
+                                  snapshot_ids.append(snap['SnapshotId'])
+                  
+                  # Wait for snapshots to complete
+                  max_wait_time = 3600
+                  start_time = time.time()
+                  
+                  while time.time() - start_time < max_wait_time:
+                      response = ec2.describe_snapshots(SnapshotIds=snapshot_ids)
+                      statuses = [snap['State'] for snap in response['Snapshots']]
+                      
+                      if 'error' in statuses:
+                          raise Exception("Snapshot creation failed")
+                      elif 'pending' not in statuses:
+                          break
+                      
+                      time.sleep(30)
+                  
+                  return {"Output": output}
+                  
+              except Exception as e:
+                  raise Exception(f"Snapshot creation failed: {str(e)}")
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CreateSnapshotAndWait
+      Timeout: 900  # 15 minutes
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+    
+  # THAY THẾ rCopySnapshotSharing + rCheckSnapshotCopySharingStatus + rCopySnapshotsToSecurity + rCheckSnapshotCopyStatus
+  rDirectCopyToSecurity:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import uuid
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  # Security account client
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+                  output = []  # ✅ FLAT ARRAY
+                  all_snapshots = []
+                  
+                  # ✅ PROCESS FLAT ARRAY INPUT
+                  for snapshot_item in event['CreateSnapshotAndWait']['Output']:
+                    # Copy directly to security account
+                    copied_snapshot = ec2.copy_snapshot(
+                        Description=f"Forensics: {event['Account']} ({snapshot_item['instanceId']})",
+                        Encrypted=True,
+                        KmsKeyId='alias/ir/master',
+                        SourceRegion=event['Region'],
+                        SourceSnapshotId=snapshot_item['snapshotId'],
+                        TagSpecifications=[{
+                            'ResourceType': 'snapshot',
+                            'Tags': [
+                                {'Key': 'ir-acquisition', 'Value': "True"},
+                                {'Key': 'case-id', 'Value': event['CaseId']}
+                            ]
+                        }]
+                    )
+                    
+                    # ✅ FLAT STRUCTURE OUTPUT
+                    output.append({
+                        "originalInstance": snapshot_item['instanceId'],
+                        "originalVolume": snapshot_item['volumeId'],
+                        "originalSnapshot": snapshot_item['snapshotId'],
+                        "copiedSnapshot": copied_snapshot['SnapshotId'],
+                        "availabilityZone": snapshot_item['availabilityZone']
+                    })
+                    all_snapshots.append(copied_snapshot['SnapshotId'])
+                  
+                  # Wait for copy completion
+                  max_wait_time = 3600
+                  start_time = time.time()
+                  
+                  while time.time() - start_time < max_wait_time:
+                      response = ec2.describe_snapshots(SnapshotIds=all_snapshots)
+                      statuses = [snap['State'] for snap in response['Snapshots']]
+                      
+                      if 'error' in statuses:
+                          raise Exception("Copy failed")
+                      elif 'pending' not in statuses:
+                          break
+                      
+                      time.sleep(60)
+
+                  return {"Output": output}
+                  
+              except Exception as e:
+                  raise Exception(f"Direct copy failed: {str(e)}")
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: DirectCopyToSecurity
+      Timeout: 900
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+  
+  # THÊM: Chức năng bắt đầu copy disk
+  rStartDiskCopy:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  ssm = boto3.client('ssm', region_name=os.environ.get('MasterRegion'))
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+                  
+                  command_ids = []
+                  
+                  # ✅ PROCESS FLAT ARRAY INPUT
+                  for item in event['CreateVolumeAndSetupDD']['Output']:
+                    instance_id = item['instanceId']
+                    volume_id = item['volumeId']
+                    
+                    # Attach volume
+                    ec2.attach_volume(
+                        Device='/dev/xvdp',
+                        InstanceId=instance_id,
+                        VolumeId=volume_id
+                    )
+                    
+                    time.sleep(10)
+                    
+                    # DD command with S3 upload
+                    commands = [
+                        "#!/bin/bash",
+                        f"export AWS_DEFAULT_REGION={event['Region']}",
+                        "export VOLUMESIZE=`fdisk -l /dev/xvdp | awk '$1==\"Disk\" && $2 ~ /^\\/dev\\/.*/ {print $3}'`",
+                        f"dd if=/dev/xvdp | tee >(gzip | aws s3 cp - {item['s3RawPath']} --metadata OriginalSize=$VOLUMESIZE --acl bucket-owner-full-control) >(md5sum | aws s3 cp - {item['s3Md5Path']} --acl bucket-owner-full-control) | sha256sum | aws s3 cp - {item['s3ShaPath']} --acl bucket-owner-full-control"
+                    ]
+                    
+                    response = ssm.send_command(
+                        InstanceIds=[instance_id],
+                        DocumentName='AWS-RunShellScript',
+                        Parameters={
+                            'commands': commands,
+                            'executionTimeout': ['43200']
+                        },
+                        Comment='Disk Acquisition'
+                    )
+                    
+                    command_ids.append(response['Command']['CommandId'])
+                
+                return {"CommandIds": command_ids}
+                
+              except Exception as e:
+                  raise Exception(f"Start disk copy failed: {str(e)}")
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: StartDiskCopy
+      Timeout: 300
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+  # THÊM: Chức năng kiểm tra trạng thái copy
+  rCheckDiskCopyStatus:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              try:
+                  ssm = boto3.client('ssm', region_name=os.environ.get('MasterRegion'))
+                  
+                  # ✅ GET INSTANCE IDS FROM FLAT ARRAY
+                  instance_ids = [item['instanceId'] for item in event['CreateVolumeAndSetupDD']['Output']]
+                  command_ids = event['StartDiskCopy']['CommandIds']
+                  
+                  for index, command_id in enumerate(command_ids):
+                      result = ssm.get_command_invocation(
+                          CommandId=command_id,
+                          InstanceId=instance_ids[index]
+                      )
+                      
+                      if result['StatusDetails'] == 'Failed':
+                          raise Exception(f"Disk copy failed: {result.get('StandardErrorContent', 'Unknown error')}")
+                      elif result['StatusDetails'] != 'Success':
+                          raise Exception("Copy still in progress")
+                  
+                  return "All disk copies completed successfully"
+                  
+              except Exception as e:
+                  if "Copy still in progress" in str(e):
+                      # This will trigger Step Functions retry
+                      raise Exception("WaitException: Copy still in progress")
+                  else:
+                      raise Exception(f"Check disk copy status failed: {str(e)}")
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CheckDiskCopyStatus
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+
+  # THAY THẾ rCreateVolumesDD + rCheckVolumeDDStatus + rCreateTargetUrls + rGetLocationData + rRunInstancesForDd
+  rCreateVolumeAndSetupDD:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          MasterRegion: !Ref "AWS::Region"
+          AvailabilityZone: !Ref pAvailabilityZone
+          S3Bucket: !Ref pIRArtifactBucket
+          AmiId: !Ref pAmiId
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+                  
+                  # Get VPC/Subnet info
+                  vpc_ids = ec2.describe_vpcs(Filters=[{'Name': 'tag:Name', 'Values': ['ir-vpc']}])
+                  vpc_id = vpc_ids['Vpcs'][0]['VpcId']
+                  
+                  subnets = ec2.describe_subnets(Filters=[
+                      {'Name': 'tag:Name', 'Values': ['ir-subnet']},
+                      {'Name': 'vpc-id', 'Values': [vpc_id]}
+                  ])
+                  subnet_id = subnets['Subnets'][0]['SubnetId']
+                  
+                  security_groups = ec2.describe_security_groups(
+                      Filters=[{'Name': 'group-name', 'Values': ['ir-instance-sg']}]
+                  )
+                  sg_id = security_groups['SecurityGroups'][0]['GroupId']
+                  
+                  output = []  # ✅ FLAT ARRAY
+                  
+                  # ✅ PROCESS FLAT ARRAY INPUT
+                  for copy_item in event['DirectCopyToSecurity']['Output']:
+                    # Get snapshot size
+                    snap_info = ec2.describe_snapshots(SnapshotIds=[copy_item['copiedSnapshot']])['Snapshots'][0]
+                    vol_size = snap_info['VolumeSize']
+                    iops = min(50 * vol_size, 64000)
+                    
+                    # Create volume
+                    volume = ec2.create_volume(
+                        AvailabilityZone=os.environ.get('AvailabilityZone'),
+                        SnapshotId=copy_item['copiedSnapshot'],
+                        KmsKeyId='alias/ir/master',
+                        Encrypted=True,
+                        VolumeType='io1',
+                        Iops=iops,
+                        TagSpecifications=[{
+                            "ResourceType": "volume",
+                            "Tags": [
+                                {'Key': 'ir-acquisition', 'Value': 'True'},
+                                {'Key': 'case-id', 'Value': event['CaseId']}
+                            ]
+                        }]
+                    )
+                    
+                    volume_id = volume['VolumeId']
+                    time.sleep(30)  # Wait for volume
+                    
+                    # Create instance
+                    instance_response = ec2.run_instances(
+                        ImageId=os.environ.get("AmiId"),
+                        InstanceType='r5a.2xlarge',
+                        MaxCount=1,
+                        MinCount=1, 
+                        SecurityGroupIds=[sg_id],
+                        SubnetId=subnet_id,
+                        TagSpecifications=[{
+                            "ResourceType": "instance",
+                            "Tags": [
+                                {"Key": "Name", "Value": f"DdCopyInstance-{event['CaseId']}"},
+                                {"Key": "ir-acquisition", "Value": "True"},
+                                {"Key": "case-id", "Value": event['CaseId']}
+                            ]
+                        }],
+                        IamInstanceProfile={'Name': 'S3CopyInstanceProfile'}
+                    )
+                    
+                    dd_instance_id = instance_response['Instances'][0]['InstanceId']
+                    
+                    # Create S3 paths
+                    prefix = f"{event['CaseId']}/{event['Account']}/{copy_item['originalInstance']}/{copy_item['originalVolume']}"
+                    
+                    # ✅ FLAT STRUCTURE OUTPUT
+                    output.append({
+                        "originalInstance": copy_item['originalInstance'],
+                        "originalVolume": copy_item['originalVolume'],
+                        "originalSnapshot": copy_item['originalSnapshot'],
+                        "copiedSnapshot": copy_item['copiedSnapshot'],
+                        "volumeId": volume_id,
+                        "instanceId": dd_instance_id,
+                        "s3RawPath": f"s3://{os.environ.get('S3Bucket')}/{prefix}.raw.gz",
+                        "s3Md5Path": f"s3://{os.environ.get('S3Bucket')}/{prefix}.raw.md5",
+                        "s3ShaPath": f"s3://{os.environ.get('S3Bucket')}/{prefix}.raw.sha256"
+                    })
+                
+                return {"Output": output}
+                
+            except Exception as e:
+                raise Exception(f"Volume and DD setup failed: {str(e)}")
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: CreateVolumeAndSetupDD
+      Timeout: 900
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      MemorySize: 256
+
+    # THAY THẾ rCheckInstanceStatusCmd + rCheckInstanceStatus
+
+  # THAY THẾ rCheckInstanceStatusCmd + rCheckInstanceStatus
+  rWaitForInstanceReady:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  ssm = boto3.client('ssm', region_name=os.environ.get('MasterRegion'))
+                  
+                  # ✅ GET INSTANCE IDS FROM FLAT ARRAY
+                  instance_ids = [item['instanceId'] for item in event['CreateVolumeAndSetupDD']['Output']]
+                  
+                  # Wait for instances to be ready
+                  max_wait = 600
+                  start_time = time.time()
+                  
+                  while time.time() - start_time < max_wait:
+                      try:
+                          response = ssm.send_command(
+                              InstanceIds=instance_ids,
+                              DocumentName='AWS-RunShellScript',
+                              Parameters={'commands': ['echo ready'], 'executionTimeout': ['60']},
+                              Comment='Instance Ready Check'
+                          )
+                          
+                          command_id = response['Command']['CommandId']
+                          time.sleep(30)
+                          
+                          all_ready = True
+                          for instance_id in instance_ids:
+                              result = ssm.get_command_invocation(
+                                  CommandId=command_id,
+                                  InstanceId=instance_id
+                              )
+                              if result['StatusDetails'] != 'Success':
+                                  all_ready = False
+                                  break
+                          
+                          if all_ready:
+                              return "All instances ready"
+                        
+                      except Exception:
+                          pass
+                
+                      time.sleep(30)
+                  
+                  raise Exception("Instances not ready within timeout")
+                  
+              except Exception as e:
+                  raise Exception(f"Instance readiness check failed: {str(e)}")
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: WaitForInstanceReady
+      Timeout: 900
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+    
+    # THAY THẾ: rDetachVolumes + rDeleteArtifactsSource + rDeleteInstanceAndVolumesSecurityAccount + rDeleteSnapshotsSecurityAccount + rDeleteCleanup
+  rUnifiedCleanup:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+          Region: !Ref "AWS::Region"
+          MasterRegion: !Ref "AWS::Region"
+      Code:
+        ZipFile: |
+          #  Copyright 2021 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+          #  This file is licensed to you under the AWS Customer Agreement (the "License").
+          #  You may not use this file except in compliance with the License.
+          #  A copy of the License is located at http://aws.amazon.com/agreement/ .
+          #  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.
+          #  See the License for the specific language governing permissions and limitations under the License.
+
+          import boto3
+          import os
+          import uuid
+          import time
+          import json
+          from botocore.exceptions import ClientError
+
+          def cleanup_source_account(event):
+            """Clean up resources in source account"""
+            results = {}
+            try:
+                # Assume role in source account
+                sts_client = boto3.client('sts')
+                assumed_role = sts_client.assume_role(
+                    RoleArn=f'arn:{os.environ.get("Partition", "aws")}:iam::{event["Account"]}:role/IRAutomation',
+                    RoleSessionName=f'{str(uuid.uuid4())[:5]}-cleanup'
+                )
+                
+                session = boto3.Session(
+                    aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
+                    aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
+                    aws_session_token=assumed_role['Credentials']['SessionToken']
+                )
+                
+                ec2 = session.client('ec2', region_name=event['Region'])
+                
+                # ✅ FIXED: Handle flat array structure for source snapshots
+                try:
+                    if 'CreateSnapshotAndWait' in event and 'Output' in event['CreateSnapshotAndWait']:
+                        for item in event['CreateSnapshotAndWait']['Output']:
+                            snapshot_id = item.get('snapshotId')
+                            if snapshot_id:
+                                try:
+                                    print(f"Deleting source snapshot {snapshot_id} from account {event['Account']} region {event['Region']}")
+                                    ec2.delete_snapshot(SnapshotId=snapshot_id)
+                                    results[f'source_snapshot_{snapshot_id}'] = 'deleted'
+                                except ClientError as e:
+                                    print(f"Failed to delete source snapshot {snapshot_id}: {e}")
+                                    results[f'source_snapshot_{snapshot_id}'] = f'failed: {e}'
+                
+                except (KeyError, AttributeError) as e:
+                    print(f"No source snapshots to delete: {e}")
+                    
+            except Exception as e:
+                print(f"Error cleaning up source account: {e}")
+                results['source_account_cleanup'] = f'failed: {e}'
+            
+            return results
+
+          def cleanup_security_account(event):
+              """Clean up resources in security account"""
+              results = {}
+              ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
+              
+              # ✅ UPDATED: Handle flat array structure
+              try:
+                  if 'CreateVolumeAndSetupDD' in event and 'Output' in event['CreateVolumeAndSetupDD']:
+                      for item in event['CreateVolumeAndSetupDD']['Output']:
+                          volume_id = item.get('volumeId')
+                          instance_id = item.get('instanceId')
+                          
+                          if volume_id and instance_id:
+                              # Detach volume
+                              try:
+                                  print(f"Detaching volume {volume_id} from instance {instance_id}")
+                                  ec2.detach_volume(InstanceId=instance_id, VolumeId=volume_id)
+                                  results[f'detach_{volume_id}'] = 'success'
+                                  time.sleep(5)
+                              except ClientError as e:
+                                  results[f'detach_{volume_id}'] = f'failed: {e}'
+                                  
+                              # Terminate instance
+                              try:
+                                  print(f"Terminating instance {instance_id}")
+                                  ec2.terminate_instances(InstanceIds=[instance_id])
+                                  results[f'terminate_{instance_id}'] = 'success'
+                              except ClientError as e:
+                                  results[f'terminate_{instance_id}'] = f'failed: {e}'
+                                  
+                              # Delete volume (after delay)
+                              time.sleep(30)
+                              try:
+                                  print(f"Deleting volume {volume_id}")
+                                  ec2.delete_volume(VolumeId=volume_id)
+                                  results[f'volume_{volume_id}'] = 'success'
+                              except ClientError as e:
+                                  results[f'volume_{volume_id}'] = f'failed: {e}'
+              
+              except Exception as e:
+                  results['cleanup_error'] = str(e)
+              
+              # Delete copied snapshots
+              try:
+                  if 'DirectCopyToSecurity' in event and 'Output' in event['DirectCopyToSecurity']:
+                      for item in event['DirectCopyToSecurity']['Output']:
+                          snapshot_id = item.get('copiedSnapshot')
+                          if snapshot_id:
+                              try:
+                                  print(f"Deleting copied snapshot {snapshot_id}")
+                                  ec2.delete_snapshot(SnapshotId=snapshot_id)
+                                  results[f'snapshot_{snapshot_id}'] = 'success'
+                              except ClientError as e:
+                                  results[f'snapshot_{snapshot_id}'] = f'failed: {e}'
+              except Exception as e:
+                  results['snapshot_cleanup_error'] = str(e)
+                  
+              return results
+
+          def lambda_handler(event, context):
+              try:
+                  print(f"Starting unified cleanup for case {event.get('CaseId', 'unknown')}")
+                  
+                  cleanup_results = {
+                      'source_account': {},
+                      'security_account': {}
+                  }
+                  
+                  # Clean up source account resources
+                  print("Cleaning up source account resources...")
+                  cleanup_results['source_account'] = cleanup_source_account(event)
+                  
+                  # Clean up security account resources
+                  print("Cleaning up security account resources...")
+                  cleanup_results['security_account'] = cleanup_security_account(event)
+                  
+                  print(f"Cleanup completed. Results: {json.dumps(cleanup_results, indent=2)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'message': 'Cleanup completed successfully',
+                      'results': cleanup_results
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Unified cleanup failed: {str(e)}"
+                  print(error_message)
+                  
+                  return {
+                      'statusCode': 500,
+                      'message': error_message,
+                      'error': {
+                          'type': e.__class__.__name__,
+                          'message': str(e)
+                      }
+                  }
+
+      Role: !GetAtt rLambdaRole.Arn 
+      FunctionName: UnifiedCleanup
+      Timeout: 300  # 5 minutes
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      MemorySize: 256
+      Description: Unified cleanup function for all IR automation resources
+
+  rStateRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: SnapshotAutomationStateRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaExecute
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt rCreateSnapshotAndWait.Arn
+                  - !GetAtt rDirectCopyToSecurity.Arn
+                  - !GetAtt rCreateVolumeAndSetupDD.Arn
+                  - !GetAtt rWaitForInstanceReady.Arn
+                  - !GetAtt rUnifiedCleanup.Arn
+                  - !GetAtt rStartDiskCopy.Arn          
+                  - !GetAtt rCheckDiskCopyStatus.Arn
+                  - !GetAtt rTagInstance.Arn
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: !Sub "states.${AWS::Region}.amazonaws.com"
+
+  rTagInstance:
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          Partition: !Ref "AWS::Partition"
+          AccountId: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import time
+
+          def lambda_handler(event, context):
+              try:
+                  # Validate required parameters
+                  if 'TagAction' not in event:
+                      raise ValueError("TagAction parameter is required (Contain|Analyze)")
+                  
+                  if 'InstanceId' not in event:
+                      raise ValueError("InstanceId parameter is required")
+                  
+                  if 'Account' not in event:
+                      raise ValueError("Account parameter is required")
+                  
+                  if 'Region' not in event:
+                      raise ValueError("Region parameter is required")
+                  
+                  # Validate TagAction value
+                  tag_action = event['TagAction'].lower()
+                  if tag_action not in ['contain', 'analyze']:
+                      raise ValueError("TagAction must be either 'Contain' or 'Analyze'")
+                  
+                  # Assume role in target account
+                  sts_client = boto3.client('sts')
+                  assumed_role = sts_client.assume_role(
+                      RoleArn=f'arn:{os.environ.get("Partition", "aws")}:iam::{event["Account"]}:role/IRAutomation',
+                      RoleSessionName=f'{str(uuid.uuid4())[:5]}-tag-{tag_action}'
+                  )
+
+                  # Create session with assumed credentials
+                  session = boto3.Session(
+                      aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
+                      aws_session_token=assumed_role['Credentials']['SessionToken']
+                  )
+
+                  # Create EC2 client
+                  ec2_client = session.client('ec2', region_name=event['Region'])
+                  
+                  # Ensure InstanceId is a list
+                  instance_ids = event['InstanceId'] if isinstance(event['InstanceId'], list) else [event['InstanceId']]
+                  
+                  # Set tag value based on action
+                  tag_value = 'Contain' if tag_action == 'contain' else 'Analyze'
+                  
+                  # Apply tags to instances
+                  for instance_id in instance_ids:
+                      print(f"Tagging instance {instance_id} with SecurityIncidentStatus={tag_value}")
+                      
+                      ec2_client.create_tags(
+                          DryRun=False,
+                          Resources=[instance_id],
+                          Tags=[
+                              {
+                                  'Key': 'SecurityIncidentStatus',
+                                  'Value': tag_value
+                              },
+                              {
+                                  'Key': 'TaggedBy',
+                                  'Value': 'IR-Automation'
+                              },
+                              {
+                                  'Key': 'TaggedAt',
+                                  'Value': str(int(time.time()))
+                              }
+                          ]
+                      )
+                  
+                  # Return success response
+                  return {
+                      'statusCode': 200,
+                      'message': f'Successfully tagged {len(instance_ids)} instance(s) with SecurityIncidentStatus={tag_value}',
+                      'taggedInstances': instance_ids,
+                      'tagValue': tag_value,
+                      'Output': event  # Maintain compatibility
+                  }
+
+              except ValueError as ve:
+                  print(f"Validation error: {ve}")
+                  return {
+                      'statusCode': 400,
+                      'error': 'Validation Error',
+                      'message': str(ve),
+                      'Output': event
+                  }
+                  
+              except Exception as e:
+                  print(f"Error tagging instance: {e}")
+                  return {
+                      'statusCode': 500,
+                      'error': 'Tagging Error',
+                      'message': str(e),
+                      'Output': event
+                  }
+
+      Role: !GetAtt rLambdaRole.Arn
+      FunctionName: TagInstance
+      Timeout: 60
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+      Description: Tag EC2 instances for incident response (Contain/Analyze)
+
+  # Forensics State Machine for Disk Acquisition
+  rForensicsStateMachineDisk:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      RoleArn: !GetAtt rStateRole.Arn
+      StateMachineName: DiskAcquisitionSimplified
+      DefinitionString: !Sub |
+        {
+          "Comment": "Simplified Disk Acquisition State Machine",
+          "StartAt": "CreateSnapshotAndWait",
+          "States": {
+            "CreateSnapshotAndWait": {
+              "Type": "Task",
+              "Resource": "${rCreateSnapshotAndWait.Arn}",
+              "ResultPath": "$.CreateSnapshotAndWait",
+              "TimeoutSeconds": 3600,
+              "Next": "DirectCopyToSecurity",
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "CleanupOnFailure",
+                "ResultPath": "$.error"
+              }]
+            },
+            "DirectCopyToSecurity": {
+              "Type": "Task", 
+              "Resource": "${rDirectCopyToSecurity.Arn}",
+              "ResultPath": "$.DirectCopyToSecurity",
+              "TimeoutSeconds": 3600,
+              "Next": "CreateVolumeAndSetupDD",
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "CleanupOnFailure", 
+                "ResultPath": "$.error"
+              }]
+            },
+            "CreateVolumeAndSetupDD": {
+              "Type": "Task",
+              "Resource": "${rCreateVolumeAndSetupDD.Arn}",
+              "ResultPath": "$.CreateVolumeAndSetupDD", 
+              "TimeoutSeconds": 3600,
+              "Next": "WaitForInstanceReady",
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "CleanupOnFailure",
+                "ResultPath": "$.error"
+              }]
+            },
+            "WaitForInstanceReady": {
+              "Type": "Task",
+              "Resource": "${rWaitForInstanceReady.Arn}",
+              "TimeoutSeconds": 900,
+              "Next": "StartDiskCopy",
+              "Retry": [{
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 10,
+                "BackoffRate": 1.5
+              }],
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"], 
+                "Next": "CleanupOnFailure",
+                "ResultPath": "$.error"
+              }]
+            },
+            "StartDiskCopy": {
+              "Type": "Task",
+              "Resource": "${rStartDiskCopy.Arn}",
+              "ResultPath": "$.StartDiskCopy",
+              "TimeoutSeconds": 300,
+              "Next": "WaitForCopyProgress",
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "CleanupOnFailure",
+                "ResultPath": "$.error"
+              }]
+            },
+            "WaitForCopyProgress": {
+              "Type": "Wait",
+              "Seconds": 300,
+              "Next": "CheckDiskCopyStatus"
+            },
+            "CheckDiskCopyStatus": {
+              "Type": "Task",
+              "Resource": "${rCheckDiskCopyStatus.Arn}",
+              "ResultPath": "$.CheckDiskCopyStatus",
+              "TimeoutSeconds": 300,
+              "Next": "TagForContainment",
+              "Retry": [{
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 300,
+                "MaxAttempts": 144,
+                "BackoffRate": 1.0,
+                "Comment": "Retry for up to 12 hours (144 * 5 minutes)"
+              }],
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "CleanupOnFailure",
+                "ResultPath": "$.error"
+              }]
+            },
+            "TagForContainment": {
+              "Type": "Task",
+              "Resource": "${rTagInstance.Arn}",
+              "Parameters": {
+                "TagAction": "Contain",
+                "InstanceId.$": "$.InstanceId",
+                "Account.$": "$.Account", 
+                "Region.$": "$.Region"
+              },
+              "Next": "Cleanup",
+              "Catch": [{
+                "ErrorEquals": ["States.ALL"],
+                "Next": "Cleanup",
+                "ResultPath": "$.tagError"
+              }]
+            },
+            "Cleanup": {
+              "Type": "Task",
+              "Resource": "${rUnifiedCleanup.Arn}",
+              "End": true,
+              "Retry": [{
+                "ErrorEquals": ["States.ALL"],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }]
+            },
+            "CleanupOnFailure": {
+              "Type": "Task", 
+              "Resource": "${rUnifiedCleanup.Arn}",
+              "Next": "FailState",
+              "Retry": [{
+                "ErrorEquals": ["States.ALL"],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }]
+            },
+            "FailState": {
+              "Type": "Fail",
+              "Cause": "Disk acquisition failed"
+            }
+          }
+        }

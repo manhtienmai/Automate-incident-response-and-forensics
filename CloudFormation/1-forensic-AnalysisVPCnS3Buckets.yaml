@@ -109,8 +109,8 @@ Resources:
           Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3CloudTrailLogs}/AWSLogs/*'
           Condition:
             StringEquals:
-              "s3:x-amz-acl": "bucket-owner-full-control"
-              "aws:SourceAccount": !Ref AWS::AccountId
+              s3:x-amz-acl: "bucket-owner-full-control"
+              aws:SourceAccount: !Ref AWS::AccountId
   S3AWSConfigLogsBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -138,7 +138,7 @@ Resources:
           Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3AWSConfigLogs}/*'
           Condition:
             StringEquals:
-              "s3:x-amz-acl": bucket-owner-full-control
+              s3:x-amz-acl: bucket-owner-full-control
 
   S3VPCFlowLogs:
     Type: AWS::S3::Bucket
@@ -248,7 +248,7 @@ Resources:
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3AWSConfigLogs}/*'
                 Condition:
                   StringEquals:
-                    "s3:x-amz-acl": bucket-owner-full-control
+                    s3:x-amz-acl: bucket-owner-full-control
               - Effect: "Allow"
                 Action:
                   - "s3:GetBucketAcl"
@@ -364,7 +364,7 @@ Resources:
       GroupDescription: Security group for EC2 instances(IR Instance) in Analysis VPC
       GroupName: ir-instance-sg
       VpcId: !Ref AnalysisVPC
-      SecurityGroupIngress:
+      SecurityGroupEgress:
         - Description: Allow all outbound traffic
           IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
