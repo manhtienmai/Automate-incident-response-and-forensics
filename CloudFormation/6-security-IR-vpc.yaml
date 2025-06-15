@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  ir-vpc
+
+  CloudFormation template to deploy and configure a VPC used for IR volume processing
+  
+Parameters:
+  pAvailabilityZone:
+    Type: "AWS::EC2::AvailabilityZone::Name"
+    Description: Availability Zone to Launch EC2 instance
+  pIRArtifactBucket:
+    Type: String
+    Description: Name of the Forensic Account S3 IR Artifacts Bucket
+    AllowedPattern: "[a-zA-Z0-9-.]*"
+    ConstraintDescription: bucket name must contain only lowercase letters, numbers, periods (.), and dashes (-).
+  pIRVpcCidr:
+    Type: String
+    Description: CIDR for the IR VPC
+    Default: 10.192.0.0/16
+    AllowedPattern: "([0-9.\\/]*)"
+    ConstraintDescription: must meet the form of an IP CIDR (e.g. 10.192.0.0/16).
+  pIRVpcSubnetCidr:
+    Type: String
+    Description: CIDR for the IR VPC Subnet
+    Default: 10.192.1.0/24
+    AllowedPattern: "([0-9.\\/]*)"
+    ConstraintDescription: must meet the form of an IP CIDR (e.g. 10.192.0.0/16).
+
+Resources:
+  rIRVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref pIRVpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ir-vpc
+
+  rIRSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: !Ref pIRVpcSubnetCidr
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref rIRVpc
+      Tags:
+        - Key: Name
+          Value: ir-subnet
+      AvailabilityZone: !Ref pAvailabilityZone
+
+  rIRRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref rIRVpc
+      Tags:
+        - Key: Name
+          Value: IR VPC Route Table
+  
+  rRouteTableIRSubnetAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref rIRRouteTable
+      SubnetId: !Ref rIRSubnet  
+
+  rInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security Group for IR Instance
+      GroupName: ir-instance-sg
+      VpcId: !Ref rIRVpc
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+    
+  rEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security Group for IR VPC Endpoints
+      GroupName: ir-vpce-sg
+      SecurityGroupIngress:
+      - IpProtocol: 'tcp'
+        FromPort: 443
+        ToPort: 443
+        SourceSecurityGroupId: !Ref rInstanceSecurityGroup 
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref rIRVpc
+
+  rS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+              - 's3:CreateMultipartUpload'
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${pIRArtifactBucket}/*"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref rIRRouteTable
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref rIRVpc
+
+  rSSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      SubnetIds:
+        - !Ref rIRSubnet
+      PrivateDnsEnabled: True
+      SecurityGroupIds: 
+        - !Ref rEndpointSecurityGroup
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref rIRVpc
+
+  rSSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      SubnetIds:
+        - !Ref rIRSubnet
+      PrivateDnsEnabled: True
+      VpcEndpointType: Interface
+      SecurityGroupIds: 
+        - !Ref rEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref rIRVpc
+
+  rEC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      SubnetIds:
+        - !Ref rIRSubnet
+      PrivateDnsEnabled: True
+      VpcEndpointType: Interface
+      SecurityGroupIds: 
+        - !Ref rEndpointSecurityGroup
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref rIRVpc
+
+  # THÊM IAM ROLE VÀ INSTANCE PROFILE
+  rAnalysisInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: IRAnalysisPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${pIRArtifactBucket}"
+                  - !Sub "arn:aws:s3:::${pIRArtifactBucket}/*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeImages
+                  - ec2:DescribeSnapshots
+                Resource: "*"
+
+  rAnalysisInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref rAnalysisInstanceRole
+
+Outputs:
+  VpcId:
+    Description: IR VPC ID
+    Value: !Ref rIRVpc
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+    
+  SubnetId:
+    Description: IR Subnet ID
+    Value: !Ref rIRSubnet
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetId"
+    
+  InstanceSecurityGroup:
+    Description: Security Group for IR instances
+    Value: !Ref rInstanceSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceSecurityGroup"
+
+  AnalysisInstanceProfile:
+    Description: IAM Instance Profile for IR Analysis
+    Value: !Ref rAnalysisInstanceProfile
+    Export:
+      Name: !Sub "${AWS::StackName}-AnalysisInstanceProfile"
+
+  AnalysisInstanceProfileArn:
+    Description: IAM Instance Profile ARN for IR Analysis
+    Value: !GetAtt rAnalysisInstanceProfile.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AnalysisInstanceProfileArn"

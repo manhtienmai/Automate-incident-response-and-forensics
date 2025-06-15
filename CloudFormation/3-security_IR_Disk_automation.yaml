@@ -203,7 +203,9 @@ Resources:
               - "kms:ListGrants"
               - "kms:RevokeGrant"
             Resource: "*"
-
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref pOrgId
           # EC2 Service access for snapshots/volumes
           - Sid: Allow ec2 to use the key
             Effect: Allow
@@ -221,10 +223,12 @@ Resources:
             Resource: "*"
             Condition:
               StringEquals:
+                aws:PrincipalOrgID: !Ref pOrgId
+              StringLike:
                 kms:ViaService: 
-                  - !Sub ec2.${AWS::Region}.amazonaws.com
-                  - !Sub sns.${AWS::Region}.amazonaws.com
-                kms:CallerAccount: !Ref AWS::AccountId
+                  - "ec2.*.amazonaws.com"       
+                  - "sns.*.amazonaws.com"
+                # kms:CallerAccount: !Ref AWS::AccountId
               Bool:
                 kms:GrantIsForAWSResource: "true"
           # Cross-account access for organization members
@@ -234,13 +238,37 @@ Resources:
               AWS: "*"
             Action:
               - kms:GenerateDataKey*
+              - kms:GenerateDataKeyWithoutPlaintext
               - kms:Decrypt
               - kms:CreateGrant
+              - kms:DescribeKey
+              - kms:ReEncrypt*
             Resource: "*"
             Condition:
               StringEquals:
                 aws:PrincipalOrgID: !Ref pOrgId
-  
+              StringLike:
+                kms:ViaService:
+                  - "sns.*.amazonaws.com"
+                  - "ec2.*.amazonaws.com"
+          - Sid: "Allow cross-account snapshot copy operations"
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - "kms:Decrypt"
+              - "kms:DescribeKey"
+              - "kms:GenerateDataKey*"
+              - "kms:ReEncrypt*"
+              - "kms:CreateGrant"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref pOrgId
+              StringLike:
+                kms:ViaService: 
+                  - "ec2.*.amazonaws.com"
+                  
   # Single alias for all IR resources
   rIRKeyAlias:
     Type: AWS::KMS::Alias
@@ -338,6 +366,7 @@ Resources:
                   - "kms:Encrypt"
                   - "kms:ReEncrypt*"
                   - "kms:GenerateDataKey*"
+                  - "kms:GenerateDataKeyWithoutPlaintext"
                   - "kms:DescribeKey"
                   - "kms:CreateGrant"
                   - "kms:ListGrants"
@@ -452,7 +481,7 @@ Resources:
                   
                   # Get instances and create snapshots
                   response = ec2.describe_instances(InstanceIds=instance_ids)
-                  output = []  # ✅ FLAT ARRAY
+                  output = [] 
                   snapshot_ids = []
                   
                   for res in response['Reservations']:
@@ -470,8 +499,15 @@ Resources:
                                           ]
                                       }]
                                   )
-                                  
-                                  # ✅ FLAT STRUCTURE
+                                  snapshot_id = snap['SnapshotId']
+
+                                  ec2.modify_snapshot_attribute(
+                                      SnapshotId=snapshot_id,
+                                      Attribute='createVolumePermission',
+                                      OperationType='add',
+                                      UserIds=[os.environ.get('AccountId')]
+                                      )
+
                                   output.append({
                                       "instanceId": instance['InstanceId'],
                                       "volumeId": vol['Ebs']['VolumeId'],
@@ -516,27 +552,37 @@ Resources:
           Partition: !Ref "AWS::Partition"
           AccountId: !Ref "AWS::AccountId"
           MasterRegion: !Ref "AWS::Region"
+          KMSKeyId: !GetAtt rIRMasterKey.Arn
       Code:
         ZipFile: |
           import boto3
           import os
           import uuid
           import time
+          import json
 
           def lambda_handler(event, context):
               try:
+                  print(f"Starting DirectCopyToSecurity with event: {json.dumps(event, default=str)}")
                   # Security account client
                   ec2 = boto3.client('ec2', region_name=os.environ.get('MasterRegion'))
-                  output = []  # ✅ FLAT ARRAY
+                  if 'CreateSnapshotAndWait' not in event or 'Output' not in event['CreateSnapshotAndWait']:
+                      raise Exception("Missing CreateSnapshotAndWait.Output in event")
+                  
+                  snapshots_to_copy = event['CreateSnapshotAndWait']['Output']
+                  print(f"Found {len(snapshots_to_copy)} snapshots to copy")
+              
+                  output = [] 
                   all_snapshots = []
                   
                   # ✅ PROCESS FLAT ARRAY INPUT
                   for snapshot_item in event['CreateSnapshotAndWait']['Output']:
+                    print(f"Copying snapshot {snapshot_item['snapshotId']} from region {event['Region']}")
                     # Copy directly to security account
                     copied_snapshot = ec2.copy_snapshot(
                         Description=f"Forensics: {event['Account']} ({snapshot_item['instanceId']})",
                         Encrypted=True,
-                        KmsKeyId='alias/ir/master',
+                        KmsKeyId= os.environ.get('KMSKeyId'),
                         SourceRegion=event['Region'],
                         SourceSnapshotId=snapshot_item['snapshotId'],
                         TagSpecifications=[{
@@ -548,6 +594,7 @@ Resources:
                         }]
                     )
                     
+                    print(f"Successfully initiated copy of snapshot {snapshot_item['snapshotId']} -> {copied_snapshot['SnapshotId']}")
                     # ✅ FLAT STRUCTURE OUTPUT
                     output.append({
                         "originalInstance": snapshot_item['instanceId'],
@@ -697,7 +744,6 @@ Resources:
       Runtime: python3.9
       MemorySize: 128
 
-  # THAY THẾ rCreateVolumesDD + rCheckVolumeDDStatus + rCreateTargetUrls + rGetLocationData + rRunInstancesForDd
   rCreateVolumeAndSetupDD:
     Type: AWS::Lambda::Function
     Properties:
@@ -709,6 +755,7 @@ Resources:
           AvailabilityZone: !Ref pAvailabilityZone
           S3Bucket: !Ref pIRArtifactBucket
           AmiId: !Ref pAmiId
+          KMSKeyId: !GetAtt rIRMasterKey.Arn
       Code:
         ZipFile: |
           import boto3
@@ -738,80 +785,77 @@ Resources:
                   
                   # ✅ PROCESS FLAT ARRAY INPUT
                   for copy_item in event['DirectCopyToSecurity']['Output']:
-                    # Get snapshot size
-                    snap_info = ec2.describe_snapshots(SnapshotIds=[copy_item['copiedSnapshot']])['Snapshots'][0]
-                    vol_size = snap_info['VolumeSize']
-                    iops = min(50 * vol_size, 64000)
-                    
-                    # Create volume
-                    volume = ec2.create_volume(
-                        AvailabilityZone=os.environ.get('AvailabilityZone'),
-                        SnapshotId=copy_item['copiedSnapshot'],
-                        KmsKeyId='alias/ir/master',
-                        Encrypted=True,
-                        VolumeType='io1',
-                        Iops=iops,
-                        TagSpecifications=[{
-                            "ResourceType": "volume",
-                            "Tags": [
-                                {'Key': 'ir-acquisition', 'Value': 'True'},
-                                {'Key': 'case-id', 'Value': event['CaseId']}
-                            ]
-                        }]
-                    )
-                    
-                    volume_id = volume['VolumeId']
-                    time.sleep(30)  # Wait for volume
-                    
-                    # Create instance
-                    instance_response = ec2.run_instances(
-                        ImageId=os.environ.get("AmiId"),
-                        InstanceType='r5a.2xlarge',
-                        MaxCount=1,
-                        MinCount=1, 
-                        SecurityGroupIds=[sg_id],
-                        SubnetId=subnet_id,
-                        TagSpecifications=[{
-                            "ResourceType": "instance",
-                            "Tags": [
-                                {"Key": "Name", "Value": f"DdCopyInstance-{event['CaseId']}"},
-                                {"Key": "ir-acquisition", "Value": "True"},
-                                {"Key": "case-id", "Value": event['CaseId']}
-                            ]
-                        }],
-                        IamInstanceProfile={'Name': 'S3CopyInstanceProfile'}
-                    )
-                    
-                    dd_instance_id = instance_response['Instances'][0]['InstanceId']
-                    
-                    # Create S3 paths
-                    prefix = f"{event['CaseId']}/{event['Account']}/{copy_item['originalInstance']}/{copy_item['originalVolume']}"
-                    
-                    # ✅ FLAT STRUCTURE OUTPUT
-                    output.append({
-                        "originalInstance": copy_item['originalInstance'],
-                        "originalVolume": copy_item['originalVolume'],
-                        "originalSnapshot": copy_item['originalSnapshot'],
-                        "copiedSnapshot": copy_item['copiedSnapshot'],
-                        "volumeId": volume_id,
-                        "instanceId": dd_instance_id,
-                        "s3RawPath": f"s3://{os.environ.get('S3Bucket')}/{prefix}.raw.gz",
-                        "s3Md5Path": f"s3://{os.environ.get('S3Bucket')}/{prefix}.raw.md5",
-                        "s3ShaPath": f"s3://{os.environ.get('S3Bucket')}/{prefix}.raw.sha256"
-                    })
-                
-                return {"Output": output}
-                
-            except Exception as e:
-                raise Exception(f"Volume and DD setup failed: {str(e)}")
+                      # Get snapshot size                                      ⬅️ 🔧 FIX: Thêm 2 spaces
+                      snap_info = ec2.describe_snapshots(SnapshotIds=[copy_item['copiedSnapshot']])['Snapshots'][0]
+                      vol_size = snap_info['VolumeSize']
+                      iops = min(50 * vol_size, 64000)
+                      
+                      # Create volume
+                      volume = ec2.create_volume(
+                          AvailabilityZone=os.environ.get('AvailabilityZone'),
+                          SnapshotId=copy_item['copiedSnapshot'],
+                          KmsKeyId=os.environ.get('KMSKeyId'),
+                          Encrypted=True,
+                          VolumeType='io1',
+                          Iops=iops,
+                          TagSpecifications=[{
+                              "ResourceType": "volume",
+                              "Tags": [
+                                  {'Key': 'ir-acquisition', 'Value': 'True'},
+                                  {'Key': 'case-id', 'Value': event['CaseId']}
+                              ]
+                          }]
+                      )
+                      
+                      volume_id = volume['VolumeId']
+                      time.sleep(30)  # Wait for volume
+                      
+                      # Create instance
+                      instance_response = ec2.run_instances(
+                          ImageId=os.environ.get("AmiId"),
+                          InstanceType='r5a.2xlarge',
+                          MaxCount=1,
+                          MinCount=1, 
+                          SecurityGroupIds=[sg_id],
+                          SubnetId=subnet_id,
+                          TagSpecifications=[{
+                              "ResourceType": "instance",
+                              "Tags": [
+                                  {"Key": "Name", "Value": f"DdCopyInstance-{event['CaseId']}"},
+                                  {"Key": "ir-acquisition", "Value": "True"},
+                                  {"Key": "case-id", "Value": event['CaseId']}
+                              ]
+                          }],
+                          IamInstanceProfile={'Name': 'S3CopyInstanceProfile'}
+                      )
+                      
+                      dd_instance_id = instance_response['Instances'][0]['InstanceId']
+                      
+                      # Create S3 paths
+                      prefix = f"{event['CaseId']}/{event['Account']}/{copy_item['originalInstance']}/{copy_item['originalVolume']}"
+                      
+                      output.append({
+                          "originalInstance": copy_item['originalInstance'],
+                          "originalVolume": copy_item['originalVolume'],
+                          "originalSnapshot": copy_item['originalSnapshot'],
+                          "copiedSnapshot": copy_item['copiedSnapshot'],
+                          "volumeId": volume_id,
+                          "instanceId": dd_instance_id,
+                          "s3RawPath": f"s3://{os.environ.get('S3Bucket')}/{prefix}.raw.gz",
+                          "s3Md5Path": f"s3://{os.environ.get('S3Bucket')}/{prefix}.raw.md5",
+                          "s3ShaPath": f"s3://{os.environ.get('S3Bucket')}/{prefix}.raw.sha256"
+                      })
+                  
+                  return {"Output": output}  # 🔧 FIX: Thụt vào cùng level với for (8 spaces)
+                  
+              except Exception as e:  # 🔧 FIX: Ngang hàng với try (4 spaces)
+                  raise Exception(f"Volume and DD setup failed: {str(e)}")
       Role: !GetAtt rLambdaRole.Arn 
       FunctionName: CreateVolumeAndSetupDD
       Timeout: 900
       Handler: index.lambda_handler
       Runtime: python3.9
       MemorySize: 256
-
-    # THAY THẾ rCheckInstanceStatusCmd + rCheckInstanceStatus
 
   # THAY THẾ rCheckInstanceStatusCmd + rCheckInstanceStatus
   rWaitForInstanceReady:
@@ -879,7 +923,6 @@ Resources:
       Runtime: python3.9
       MemorySize: 128
     
-    # THAY THẾ: rDetachVolumes + rDeleteArtifactsSource + rDeleteInstanceAndVolumesSecurityAccount + rDeleteSnapshotsSecurityAccount + rDeleteCleanup
   rUnifiedCleanup:
     Type: AWS::Lambda::Function
     Properties:

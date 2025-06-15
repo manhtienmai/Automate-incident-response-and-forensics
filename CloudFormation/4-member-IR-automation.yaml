@@ -93,7 +93,73 @@ Resources:
                   - iam:PassRole
                   - sns:Publish
                 Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                  - kms:CreateGrant
+                Resource: 
+                  # - !Sub "arn:aws:kms:${AWS::Region}:${pSecurityAccount}:key/*"
+                  # Hard-code security account thay vì dùng parameter thiếu
+                  - !Sub "arn:aws:kms:${AWS::Region}:869935071719:key/*"
+                  - !Sub "arn:aws:kms:${AWS::Region}:869935071719:alias/ir/master"
+                  # Backup với specific key ID
+                  - !Sub "arn:aws:kms:${AWS::Region}:869935071719:key/2c019775-2f8f-4c4b-a45a-4bc6dc847d44"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: 
+                      - !Sub "sns.${AWS::Region}.amazonaws.com"
 
+  # Cross-account role for Security Account to assume
+  rIRAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: IRAutomation  # ← Đây là ROLE NAME mà Security Account cần
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${pSecurityAccount}:root"  # Security Account
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: "o-d5ito60pcr" 
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+      Policies:
+        - PolicyName: IRCrossAccountPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:CreateTags
+                  - ec2:DeleteSnapshot
+                  - ec2:ModifySnapshotAttribute
+                  - ec2:DescribeSnapshotAttribute
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstanceTypes
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:CreateGrant
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:GenerateDataKey*
+                  - kms:ReEncrypt*
+                  - kms:Encrypt
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ec2.${AWS::Region}.amazonaws.com"
+                
   # 3️⃣ SNS TOPIC - Local notifications
   rLocalSNSTopic:
     Type: AWS::SNS::Topic
@@ -120,7 +186,7 @@ Resources:
           import json
           import urllib3
           import os
-          
+          import time
           http = urllib3.PoolManager()
           
           def handler(event, context):
@@ -165,7 +231,8 @@ Resources:
           import boto3
           import json
           import os
-          
+          import time
+
           ec2 = boto3.client('ec2')
           sns = boto3.client('sns')
           
@@ -234,8 +301,9 @@ Resources:
                   pass
               
               # Add new profile
+              profile_name = new_profile_arn.split('/')[-1]
               ec2.associate_iam_instance_profile(
-                  IamInstanceProfile={'Arn': new_profile_arn},
+                  IamInstanceProfile={'Name': profile_name},
                   InstanceId=instance_id
               )
           
@@ -284,12 +352,13 @@ Resources:
               message = {
                   "account": boto3.client('sts').get_caller_identity()['Account'],
                   "instance_id": instance_id,
-                  "region": os.environ['AWS_REGION']
+                  "region": os.environ['AWS_REGION'],
               }
               
               sns.publish(
                   TopicArn=os.environ['SECURITY_SNS'],
-                  Message=json.dumps(message)
+                  Message=json.dumps(message),
+                  Subject="IR Incident Analysis Required"
               )
           
           def notify_local(message):
